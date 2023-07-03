@@ -6,5 +6,5 @@ services:
   app: 
     image: python:3.9
     container_name: python
-    volumes: 
+    volumes:
       -  ./app:/app
