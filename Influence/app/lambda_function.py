@@ -1,11 +1,12 @@
 import os
 import json
 import boto3
+from datetime import datetime
 from linebot import LineBotApi, WebhookParser
-from linebot.exceptions import LineBotApiError, InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import TextSendMessage
 from langchain.chains import ConversationChain
 from langchain.memory import ConversationBufferMemory , ConversationBufferWindowMemory
+from langchain.memory.chat_message_histories import DynamoDBChatMessageHistory
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import (
     ChatPromptTemplate, 
@@ -19,6 +20,8 @@ from langchain.prompts import (
 access_token = os.environ.get('access_token')
 secret_key = os.environ.get('secret_key')
 channel_secret = os.environ.get('channel_secret')
+aws_access_key_id = os.environ.get('aws_access_key')
+aws_secret_access_key = os.environ.get('aws_secret_key')
 template = '''
 これから会話を行います。以下の条件を絶対に守って回答してください。
 
@@ -49,9 +52,13 @@ Youtube,Tiktok,instagramなどを介したインフルエンサーとしても�
 会話を続けることが難しかったら話題を逸らしてください。
 関西弁などは用いず，標準語で話してください。
 友達と会話するように話してください。
-
+簡潔に会話し，長文は送らないでください。
 '''
 
+# daynamoDBの設定
+dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)
+client = boto3.client('dynamodb')
+table_names = client.list_tables()['TableNames']
 
 def lambda_handler(event, context):
     # jsonの読み込み
@@ -65,21 +72,89 @@ def lambda_handler(event, context):
     events = line_parser.parse(body,signature)
     # LangChainの設定
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=secret_key, temperature=0.8)
-    memory = ConversationBufferWindowMemory(k=5, return_messages=True)
-    # memory = ConversationBufferMemory(return_messages=True)
     prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(template),
         MessagesPlaceholder(variable_name="history"),
         HumanMessagePromptTemplate.from_template("{input}")
     ])
-    chain = ConversationChain(memory=memory, prompt=prompt, llm=llm)
     # LINE パラメータの取得
     for event in events:
         line_user_id = event.source.user_id
         line_message = event.message.text
         profile = line_bot_api.get_profile(line_user_id)
         user_name = profile.display_name
-        ai_message = chain.predict(input=line_message)
+        # ユーザーIDのテーブルが存在する場合，過去のチャット内容をDBから受け取る
+        if line_user_id in table_names:
+            # LangChainの設定と，ai_messageの生成
+            message_history = DynamoDBChatMessageHistory(table_name=line_user_id, session_id="0")
+            memory = ConversationBufferMemory(
+              memory_key="history", chat_memory=message_history, return_messages=True
+            )
+            chain = ConversationChain(memory=memory, prompt=prompt, llm=llm)
+            ai_message = chain.predict(input=line_message)
+            # LINE メッセージの送信
+            line_bot_api.push_message(line_user_id, TextSendMessage(chain.predict(input=line_message)))
+            # DBを更新
+            table = dynamodb.Table(line_user_id)
+            response = table.update_item(
+                Key={'SessionId': 'msg_ID'},
+                UpdateExpression='ADD msg_counter :inc',
+                ExpressionAttributeValues={':inc': 1},
+                ReturnValues="UPDATED_NEW"
+            )
+            now = datetime.now()
+            now_str = now.isoformat()
+            new_id = response['Attributes']['msg_counter']
+            table.put_item(
+                Item={
+                    'SessionId': str(new_id),
+                    'line_message': line_message,
+                    'ai_message': ai_message,
+                    'LastUpdated': now_str
+                }
+            )
+            response = table.scan()
+        # ユーザーIDのテーブルが存在しない場合，新しくテーブルを作成し，そこにチャット内容を追加できるようにする
+        else:
+            # LangChainの設定と，ai_messageの生成
+            memory = ConversationBufferMemory(return_messages=True)
+            chain = ConversationChain(memory=memory, prompt=prompt, llm=llm)
+            ai_message = chain.predict(input=line_message)
+            # LINE メッセージの送信
+            line_bot_api.push_message(line_user_id, TextSendMessage(chain.predict(input=line_message)))
+            # DBを作成，更新
+            table = dynamodb.create_table(
+                TableName=line_user_id,
+                KeySchema=[{"AttributeName": "SessionId", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "SessionId", "AttributeType": "S"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table.meta.client.get_waiter("table_exists").wait(TableName=line_user_id)
+            table.put_item(
+              Item={
+                  'SessionId': 'msg_ID',
+                  'msg_counter': 0
+              }
+            )
+            response = table.update_item(
+                Key={'SessionId': 'msg_ID'},
+                UpdateExpression='ADD msg_counter :inc',
+                ExpressionAttributeValues={':inc': 1},
+                ReturnValues="UPDATED_NEW"
+            )
+            now = datetime.now()
+            now_str = now.isoformat()
+            new_id = response['Attributes']['msg_counter']
+            table.put_item(
+                Item={
+                    'SessionId': str(new_id),
+                    'line_message': line_message,
+                    'ai_message': ai_message,
+                    'LastUpdated': now_str
+                }
+            )
+            response = table.scan()
+        # s3に保存
         s3 = boto3.resource('s3')
         obj = s3.Bucket(BUCKET_NAME).Object(UPLOAD_BUCKET_KEY)
         data = obj.get()['Body'].read().decode('utf-8')
@@ -94,9 +169,6 @@ def lambda_handler(event, context):
             }
         json_data.update(new_data)
         res = obj.put(Body=json.dumps(json_data, ensure_ascii=False))
-
-        # LINE メッセージの送信
-        line_bot_api.push_message(line_user_id, TextSendMessage(ai_message))
     
     ok_json = {"isBase64Encoded": False , "statusCode": 200 , "headers": {} , "body": ""}
     return ok_json
